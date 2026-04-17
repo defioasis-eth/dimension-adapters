@@ -1,5 +1,6 @@
-import { FetchOptions, SimpleAdapter } from "../../adapters/types";
+import { Dependencies, FetchOptions, SimpleAdapter } from "../../adapters/types";
 import { CHAIN } from "../../helpers/chains";
+import { queryDuneSql } from "../../helpers/dune";
 import { METRIC } from "../../helpers/metrics";
 
 const PRINTR_CONTRACT = "0xb77726291b125515d0a7affeea2b04f2ff243172";
@@ -10,11 +11,33 @@ const TOKEN_TRADE_EVENT =
 const GET_CURVE_ABI =
   "function getCurve(address token) view returns (tuple(address basePair, uint16 totalCurves, uint256 maxTokenSupply, uint256 virtualReserve, uint256 reserve, uint256 completionThreshold))";
 
+const PRINTR_SOLANA_BONDING_CURVE_PROGRAM = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
+
 // 1% total bonding curve swap fee
 // Fee split: 25% creator, 25% memecoin reserve, 40% buyback, 10% team
 const FEE_RATE = 1 / 100;
 
-const fetch = async ({ getLogs, createBalances, api }: FetchOptions) => {
+const getFeeBreakdownFromVolume = (dailyVolume: ReturnType<FetchOptions["createBalances"]>) => {
+  // Derive fee breakdown from volume
+  const dailyFees = dailyVolume.clone(FEE_RATE, METRIC.SWAP_FEES); // 1% total fee
+  const dailyRevenue = dailyVolume.clone(FEE_RATE * 0.1, METRIC.PROTOCOL_FEES);
+  dailyRevenue.add(dailyVolume.clone(FEE_RATE * 0.25, 'Memecoin Reserve'));
+  dailyRevenue.add(dailyVolume.clone(FEE_RATE * 0.4, METRIC.TOKEN_BUY_BACK));
+  const dailyProtocolRevenue = dailyVolume.clone(FEE_RATE * 0.1, METRIC.PROTOCOL_FEES);
+  dailyProtocolRevenue.add(dailyVolume.clone(FEE_RATE * 0.25, 'Memecoin Reserve'));
+  const dailyHoldersRevenue = dailyVolume.clone(FEE_RATE * 0.4, METRIC.TOKEN_BUY_BACK);
+  const dailySupplySideRevenue = dailyVolume.clone(FEE_RATE * 0.25, METRIC.CREATOR_FEES);
+
+  return {
+    dailyFees,
+    dailyRevenue,
+    dailyProtocolRevenue,
+    dailyHoldersRevenue,
+    dailySupplySideRevenue,
+  }
+}
+
+const fetchEvm = async ({ getLogs, createBalances, api }: FetchOptions) => {
   const dailyVolume = createBalances();
 
   const tradeLogs = await getLogs({
@@ -54,29 +77,63 @@ const fetch = async ({ getLogs, createBalances, api }: FetchOptions) => {
     dailyVolume.add(basePair, log.cost);
   }
 
-  // Derive fee breakdown from volume
-  const dailyFees = dailyVolume.clone(FEE_RATE, METRIC.SWAP_FEES); // 1% total fee
-  const dailyRevenue = dailyVolume.clone(FEE_RATE * 0.1, METRIC.PROTOCOL_FEES);
-  dailyRevenue.add(dailyVolume.clone(FEE_RATE * 0.25, 'Memecoin Reserve'));
-  dailyRevenue.add(dailyVolume.clone(FEE_RATE * 0.4, METRIC.TOKEN_BUY_BACK));
-  const dailyProtocolRevenue = dailyVolume.clone(FEE_RATE * 0.1, METRIC.PROTOCOL_FEES);
-  dailyProtocolRevenue.add(dailyVolume.clone(FEE_RATE * 0.25, 'Memecoin Reserve'));
-  const dailyHoldersRevenue = dailyVolume.clone(FEE_RATE * 0.4, METRIC.TOKEN_BUY_BACK);
-  const dailySupplySideRevenue = dailyVolume.clone(FEE_RATE * 0.25, METRIC.CREATOR_FEES);
-
   return {
     dailyVolume,
-    dailyFees,
-    dailyRevenue,
-    dailyProtocolRevenue,
-    dailyHoldersRevenue,
-    dailySupplySideRevenue,
+    ...getFeeBreakdownFromVolume(dailyVolume),
   };
 };
 
+interface ISolanaVolumeRow {
+  payment_mint: string;
+  payment_amount: string;
+}
+
+const fetchSolana = async (_a: any, _b: any, options: FetchOptions) => {
+  // Methodology alignment with EVM:
+  // EVM tracks TokenTrade.cost in the basePair token.
+  // Solana DBC swap events expose the quote mint and quote leg amount directly:
+  //  - trade_direction = 1: user pays quote mint as amount_in
+  //  - trade_direction = 0: user receives quote mint as output_amount
+  // In both cases we accumulate the quote/payment leg by mint.
+  const rows: ISolanaVolumeRow[] = await queryDuneSql(options, `
+    WITH printr_swaps AS (
+      SELECT
+        account_quote_mint AS payment_mint,
+        CASE
+          WHEN trade_direction = 1 THEN COALESCE(amount_in, 0)
+          ELSE COALESCE(CAST(JSON_EXTRACT_SCALAR(swap_result, '$.SwapResult.output_amount') AS DECIMAL(38,0)), 0)
+        END AS payment_amount
+      FROM meteora_solana.dynamic_bonding_curve_evt_evtswap
+      WHERE evt_executing_account = '${PRINTR_SOLANA_BONDING_CURVE_PROGRAM}'
+        AND evt_block_time >= from_unixtime(${options.startTimestamp})
+        AND evt_block_time < from_unixtime(${options.endTimestamp})
+    )
+    SELECT
+      payment_mint,
+      CAST(SUM(payment_amount) AS VARCHAR) AS payment_amount
+    FROM printr_swaps
+    GROUP BY payment_mint
+  `)
+
+  const dailyVolume = options.createBalances()
+  rows.forEach((row) => {
+    dailyVolume.add(row.payment_mint, row.payment_amount)
+  })
+
+  return {
+    dailyVolume,
+    ...getFeeBreakdownFromVolume(dailyVolume),
+  }
+}
+
+const fetch = async (options: FetchOptions) => {
+  if (options.chain === CHAIN.SOLANA) return fetchSolana(null, null, options)
+  return fetchEvm(options)
+}
+
 const methodology = {
   Volume:
-    "Total trading volume from bonding curve buys and sells on the Printr protocol, tracked via on-chain TokenTrade events. Each trade's cost is denominated in the curve's base pair token (e.g. USDC, WETH, BNB).",
+    "Total trading volume from Printr bonding curve buys and sells, tracked as payment-side trade cost. On EVM this is TokenTrade.cost in the curve base pair token; on Solana this is the quote/payment mint leg from DBC swap events (amount_in for buys, quote output_amount for sells).",
   Fees: "Printr charges a 1% fee on all bonding curve swaps.",
   Revenue:
     "75% of trading fees: team (10%), protocol-controlled memecoin reserve (25%), and buyback (40%).",
@@ -112,9 +169,10 @@ const breakdownMethodology = {
 const adapter: SimpleAdapter = {
   version: 2,
   pullHourly: true,
+  dependencies: [Dependencies.DUNE],
   fetch,
   start: '2025-10-14',
-  chains: [CHAIN.ARBITRUM, CHAIN.BASE, CHAIN.AVAX, CHAIN.MANTLE, CHAIN.MONAD, CHAIN.BSC, CHAIN.ETHEREUM],
+  chains: [CHAIN.ARBITRUM, CHAIN.BASE, CHAIN.AVAX, CHAIN.MANTLE, CHAIN.MONAD, CHAIN.BSC, CHAIN.ETHEREUM, CHAIN.SOLANA],
   methodology,
   breakdownMethodology,
 };
