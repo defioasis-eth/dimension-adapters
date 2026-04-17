@@ -89,7 +89,7 @@ const fetchEvm = async ({ getLogs, createBalances, api }: FetchOptions) => {
 
 interface ISolanaVolumeRow {
   payment_mint: string;
-  payment_amount: string;
+  payment_amount: string | number;
 }
 
 const fetchSolana = async (_a: any, _b: any, options: FetchOptions) => {
@@ -121,8 +121,8 @@ const fetchSolana = async (_a: any, _b: any, options: FetchOptions) => {
       SELECT
         p.account_quote_mint AS payment_mint,
         CASE
-          WHEN trade_direction = 1 THEN COALESCE(amount_in, 0)
-          ELSE COALESCE(CAST(JSON_EXTRACT_SCALAR(swap_result, '$.SwapResult.output_amount') AS DECIMAL(38,0)), 0)
+          WHEN s.trade_direction = 1 THEN COALESCE(s.amount_in, 0)
+          ELSE COALESCE(CAST(JSON_EXTRACT_SCALAR(s.swap_result, '$.SwapResult.output_amount') AS DECIMAL(38,0)), 0)
         END AS payment_amount
       FROM meteora_solana.dynamic_bonding_curve_evt_evtswap s
       JOIN printr_dbc_pools p ON s.config = p.account_config
@@ -132,7 +132,7 @@ const fetchSolana = async (_a: any, _b: any, options: FetchOptions) => {
     )
     SELECT
       payment_mint,
-      CAST(SUM(payment_amount) AS VARCHAR) AS payment_amount
+      SUM(payment_amount) AS payment_amount
     FROM printr_swaps
     GROUP BY payment_mint
   `)
